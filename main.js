@@ -370,9 +370,10 @@
         #sb-helper-panel .node-grade-blue { color: #7fb8d9; }
         #sb-helper-panel .node-grade-green { color: #6fbf73; }
         #sb-helper-panel .node-grade-red { color: #d97878; }
-        #sb-show-panel-btn, #sb-show-monster-btn {
+        #sb-show-panel-btn {
             position: fixed;
             bottom: 10px;
+            right: 10px;
             background: #2c5c33;
             color: #eee;
             border: none;
@@ -385,18 +386,8 @@
             box-shadow: 0 2px 8px rgba(0,0,0,0.4);
             display: none;
         }
-        #sb-show-panel-btn {
-            right: 10px;
-        }
-        #sb-show-monster-btn {
-            left: 10px;
-            background: #6b3535;
-        }
         #sb-show-panel-btn:hover {
             background: #35723d;
-        }
-        #sb-show-monster-btn:hover {
-            background: #7d3e3e;
         }
         /* ---- Available Skills modal ---- */
         #sb-skills-modal, #sb-inventory-modal {
@@ -668,6 +659,21 @@
     window.__lastTargetId = null;
     window.__maxHp = null;
     window.__maxMp = null;
+    // Level/XP/SP snapshot for the Main tab (progress.update, plus level from
+    // zone.init where available). Null fields render as "?" until the game
+    // sends them.
+    window.__playerLevel = null;
+    window.__xp = null;
+    window.__xpToNext = null;
+    window.__sp = null;
+    window.__spExp = null;
+    window.__spExpToNext = null;
+    // Masteries (from zone.init self.masteries: [{ masteryId, level }]) and
+    // the subset the player wants auto-raised on level up (Main tab -
+    // Auto Masteries). __autoMasteryIds is restored per-character.
+    window.__masteries = [];
+    window.__autoMasteryIds = [];
+    window.__masteriesRestoredForCharId = null;
     window.__playerId = null;
     window.__entityCache = {};
     window.__staleEntityMs = 20000; // how long a monster can go without an update before it's pruned
@@ -720,6 +726,14 @@
     window.__pickupRetries = {};     // itemId -> retry count
     window.__pickupTimeoutMs = 4000; // time to wait for confirmation before retry/skip
     window.__pickupMaxRetries = 2;
+    // itemId -> true for items that came back ERR_OWNER_LOCK (killed by/
+    // owned by someone else - not ours to loot while item share is off).
+    // Checked by enqueuePickup so a re-announced ground item doesn't just
+    // get queued and rejected again. See the ERR_OWNER_LOCK handler.
+    window.__lootOwnerLocked = {};
+    // Entity IDs removed by the most recent state.delta "rem" - see the
+    // entity.pickup handler for why.
+    window.__lastRemIds = [];
     window.__logEntries = [];
     window.__isInitialized = false;
     // Per-character skill persistence
@@ -810,9 +824,39 @@
     // around - only mark a *self* buff (Skills tab) as needing the swap if
     // you've confirmed it actually survives switching back.
     window.__partyBuffs = [];
+    // Revive skill(s) - same shape as __partyBuffs ({ base, level, fullName,
+    // needsWeaponSwap }), but cast on party members reported "dead" (see
+    // party.update's member.dead) instead of ones missing a fresh buff.
+    window.__reviveSkills = [];
     // Vitals (HP/MP) - fixed display, updated in place instead of logged
     window.__hp = null;
     window.__mp = null;
+    // Set on ERR_DEAD, cleared once vitals.update reports hp > 0 again -
+    // see logSpecial's ERR_DEAD handler and botLoopTick.
+    window.__playerDead = false;
+    // ---- Growth pet ("gpet" - a separate attack pet, e.g. pet_wolf) ----
+    // Full snapshot from the game's own gpet.state packets (sent roughly
+    // every tick while a pet is out, same cadence as entity.move) - not a
+    // delta, so each one just replaces this outright. Null fields render as
+    // "?" until the game sends them (see updateGpetPanel).
+    window.__gpet = {
+        active: false, petId: null, entityId: null, bagSlot: null,
+        level: null, xp: null, xpToNext: null,
+        hp: null, maxHp: null, hgp: null, hgpMax: null,
+        dead: false, mode: null,
+    };
+    // Auto-heal: when the pet's HP drops to/below this percent of its
+    // maxHp, use the configured bag item on it (same inv.use mechanism as
+    // castItemBuff - confirmed via capture: inv.use on a hp-potion slot
+    // while a pet is active heals the pet, not the player, and reports back
+    // via fx.itemUsed { group: "gpet.hp" }). Both are per-character, like
+    // the other loadout settings - see restoreGpetHealForChar.
+    window.__gpetHealItemId = null;
+    window.__gpetHealThresholdPct = 50;
+    window.__gpetHealLastUsedAt = 0;
+    window.__gpetHealCooldownMs = 3000; // don't re-send faster than gpet.state updates could reflect it
+    window.__gpetHealItemMissingLoggedAt = 0;
+    window.__gpetHealItemMissingWarnMs = 30000;
     // Packet debug (IN/OUT to console) - off by default
     window.__debugWS = false;
     // Ring buffer of every IN/OUT packet seen while debug is ON, so the log
@@ -831,6 +875,17 @@
     // attack whatever's closest, anywhere).
     window.__botCenter = null;      // { x, z } snapshot taken at Start Bot
     window.__botRadius = 0;         // game units; 0/negative = no limit
+    // ---- Roaming (no monster in range) ----
+    // Wanders to a random point instead of just sitting still waiting for
+    // something to spawn. See roamRandomly().
+    window.__lastRoamAt = 0;
+    window.__roamIntervalMs = 4000; // don't send a new move.click more often than this
+    window.__roamRadiusFallback = 400; // used when __botRadius is 0/unlimited
+    // Checkbox: this character's bot loop keeps buffs (self/item/party) up
+    // but never attacks or loots - for support characters that should just
+    // stand in the party buffing everyone else. Per-character, not global -
+    // see restorePassiveModeForChar().
+    window.__passiveMode = false;
     // ---- Stuck / obstacle detection ----
     // A monster behind a wall or other obstacle can be "in range" and
     // targetable but never actually take damage (skill.cast/combat.attack
@@ -1031,6 +1086,116 @@
         } else {
             addLog(`Active skills (${window.__activeSkills.length}):`, 'info');
             window.__activeSkills.forEach(s => addLog(`  ${s.fullName} (${s.base}, level ${s.level})`, 'info'));
+        }
+    }
+    // ---- Per-character auto-mastery persistence (localStorage) ----
+    // Same pattern as the skill persistence above - keyed by charId, stores
+    // just the list of masteryIds the player checked "auto" for (see the
+    // Auto Masteries section, Main tab).
+    const AUTO_MASTERY_STORAGE_KEY = 'sb_auto_masteries_by_char';
+    function loadAutoMasteryConfig() {
+        try {
+            return JSON.parse(localStorage.getItem(AUTO_MASTERY_STORAGE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+    function saveAutoMasteriesForChar() {
+        if (!window.__charId) return;
+        const cfg = loadAutoMasteryConfig();
+        cfg[window.__charId] = window.__autoMasteryIds;
+        try {
+            localStorage.setItem(AUTO_MASTERY_STORAGE_KEY, JSON.stringify(cfg));
+        } catch (e) {
+            addLog('Could not save auto-mastery config to localStorage.', 'error');
+        }
+    }
+    function restoreAutoMasteriesForChar() {
+        if (!window.__charId) return;
+        const cfg = loadAutoMasteryConfig();
+        const saved = cfg[window.__charId];
+        window.__autoMasteryIds = Array.isArray(saved) ? saved : [];
+    }
+    // Toggled from the Auto Masteries checkboxes (Main tab).
+    window.setAutoMastery = function(masteryId, enabled) {
+        const idx = window.__autoMasteryIds.indexOf(masteryId);
+        if (enabled && idx === -1) window.__autoMasteryIds.push(masteryId);
+        if (!enabled && idx !== -1) window.__autoMasteryIds.splice(idx, 1);
+        saveAutoMasteriesForChar();
+        addLog(`Auto-raise for mastery "${masteryId}": ${enabled ? 'ON' : 'OFF'}`, 'info');
+        // Checking the box only wires up *future* level-ups (setPlayerLevel)
+        // - it doesn't by itself fix a mastery that's already behind (e.g.
+        // char level 29, mastery still at 28 from before this was turned
+        // on). Catch it up right away too.
+        if (enabled) catchUpMastery(masteryId);
+    };
+    // Sends one mastery.raise per level of backlog (assumes 1 point per
+    // character level - same assumption the level-up handler makes) until
+    // the mastery matches window.__playerLevel. There's no confirmed ack
+    // packet to wait on, so each send optimistically decrements the local
+    // copy and the next one is paced a bit behind it instead of firing all
+    // at once. Stops early if the checkbox gets unchecked mid-catch-up.
+    function catchUpMastery(masteryId) {
+        const entry = window.__masteries.find(m => m.masteryId === masteryId);
+        if (!entry || typeof window.__playerLevel !== 'number') return;
+        const behind = window.__playerLevel - entry.level;
+        if (behind <= 0) return;
+        addLog(`Mastery "${masteryId}" is ${behind} level(s) behind - catching up...`, 'info');
+        const sendNext = () => {
+            if (!window.__autoMasteryIds.includes(masteryId)) return;
+            if (entry.level >= window.__playerLevel) return;
+            window.raiseMastery(masteryId);
+            entry.level += 1;
+            updateMasteriesPanel();
+            if (entry.level < window.__playerLevel) setTimeout(sendNext, 400);
+        };
+        sendNext();
+    }
+    // Confirmed packet format: OUT { t: "mastery.raise", d: { masteryId } }
+    window.raiseMastery = function(masteryId) {
+        window.__sendWS({ t: 'mastery.raise', d: { masteryId } });
+        addLog(`Mastery raise requested: ${masteryId}`, 'info');
+    };
+    // Fixed mastery list + "auto" checkbox (Main tab). Re-rendered whenever
+    // zone.init refreshes window.__masteries or a checkbox is toggled.
+    function updateMasteriesPanel() {
+        const el = document.getElementById('sb-masteries-list');
+        if (!el) return;
+        if (!Array.isArray(window.__masteries) || window.__masteries.length === 0) {
+            el.innerHTML = `<div class="panel-list-empty">No mastery data yet.</div>`;
+            return;
+        }
+        el.innerHTML = window.__masteries.map(m => {
+            const checked = window.__autoMasteryIds.includes(m.masteryId);
+            const label = m.masteryId ? m.masteryId.charAt(0).toUpperCase() + m.masteryId.slice(1) : 'Unknown';
+            return `
+                <div class="panel-skill-row">
+                    <span class="panel-skill-name">${label} <span class="panel-skill-timer">(Lv.${m.level})</span></span>
+                    <label style="display:flex;align-items:center;gap:3px;flex-shrink:0;color:#999;">
+                        <input type="checkbox" class="mastery-auto-toggle" data-mastery="${m.masteryId}" ${checked ? 'checked' : ''} /> auto
+                    </label>
+                </div>
+            `;
+        }).join('');
+        el.querySelectorAll('.mastery-auto-toggle').forEach(cb => {
+            cb.addEventListener('change', (e) => {
+                window.setAutoMastery(cb.getAttribute('data-mastery'), e.target.checked);
+            });
+        });
+    }
+    // Central setter for the player's character level - called from both
+    // zone.init's self.level (login/zone snapshot) and progress.levelUp's
+    // level (confirmed live level-up event) - and fires one auto-raise per
+    // checked mastery when it goes up. Ignores the first value seen this
+    // session (no prior level to compare against yet).
+    function setPlayerLevel(newLevel) {
+        if (typeof newLevel !== 'number') return;
+        const prev = window.__playerLevel;
+        window.__playerLevel = newLevel;
+        updateVitalsDisplay();
+        if (prev !== null && newLevel > prev) {
+            addLog(`Level up: ${prev} -> ${newLevel}.`, 'xp');
+            window.__autoMasteryIds.forEach(masteryId => window.raiseMastery(masteryId));
         }
     }
     // ---- Buffs (self-cast, auto-refreshed) ----
@@ -1273,6 +1438,11 @@
         window.__buffLastCastAt[entry.base] = Date.now();
         addLog(`Party buff: casting ${entry.fullName} on ${member.name}.`, 'info');
     }
+    function castReviveSkill(entry, member) {
+        window.__sendWS({ t: "skill.cast", d: { groupId: entry.base, targetId: member.entityId } });
+        window.__buffLastCastAt[entry.base] = Date.now();
+        addLog(`Revive: casting ${entry.fullName} on ${member.name}.`, 'info');
+    }
     // Called from the bot loop tick. Maintains self-buffs, item buffs, and
     // party-buffs together since self- and party-buffs can share the same
     // weapon-swap gear:
@@ -1326,8 +1496,17 @@
                 }
             }
         }
+        // Confirmed via party.update: a dead member carries dead: true and
+        // hp: 0.
+        const deadTargets = partyTargets.filter(m => m.dead || m.hp === 0);
+        const reviveNeeded = [];
+        for (const entry of window.__reviveSkills) {
+            for (const member of deadTargets) {
+                reviveNeeded.push({ entry, member });
+            }
+        }
 
-        const anyNeedsSwapGear = selfNeeded.some(b => b.needsWeaponSwap) || partyNeeded.some(p => p.entry.needsWeaponSwap);
+        const anyNeedsSwapGear = selfNeeded.some(b => b.needsWeaponSwap) || partyNeeded.some(p => p.entry.needsWeaponSwap) || reviveNeeded.some(r => r.entry.needsWeaponSwap);
 
         for (const buff of selfNeeded) {
             if (buff.needsWeaponSwap && !window.__weaponSwappedToBuffGear) continue;
@@ -1335,6 +1514,12 @@
             addLog(`Refreshing buff: ${buff.fullName}`, 'info');
             castBuff(buff.base);
         }
+        // Revive takes priority over regular party buffs - a dead member
+        // waiting on a buff refresh isn't going anywhere either way.
+        const reviveActionable = reviveNeeded.find(r =>
+            (!r.entry.needsWeaponSwap || window.__weaponSwappedToBuffGear) && canAttemptBuffCast(r.entry.base)
+        );
+        if (reviveActionable) castReviveSkill(reviveActionable.entry, reviveActionable.member);
         const partyActionable = partyNeeded.find(p =>
             (!p.entry.needsWeaponSwap || window.__weaponSwappedToBuffGear) && canAttemptBuffCast(p.entry.base)
         );
@@ -1448,6 +1633,78 @@
         addLog(`Restored ${window.__activeItemBuffs.length} saved item buff(s) for this character.`, 'info');
         updateItemBuffsPanel();
     }
+    // ---- Growth pet auto-heal (item + HP% threshold, localStorage,
+    // per-character). Reuses findBagSlotForItem/inv.use, same mechanism as
+    // castItemBuff above, but triggered off the pet's own HP (from
+    // gpet.state) instead of a buff-expiry timer. ----
+    function maybeHealGpet() {
+        const pet = window.__gpet;
+        if (!pet.active || pet.dead) return;
+        if (!window.__gpetHealItemId) return;
+        if (typeof pet.hp !== 'number' || typeof pet.maxHp !== 'number' || pet.maxHp <= 0) return;
+        const pct = (pet.hp / pet.maxHp) * 100;
+        if (pct > window.__gpetHealThresholdPct) return;
+        if (Date.now() - window.__gpetHealLastUsedAt < window.__gpetHealCooldownMs) return;
+        const slot = findBagSlotForItem(window.__gpetHealItemId);
+        if (slot === null) {
+            if (Date.now() - window.__gpetHealItemMissingLoggedAt > window.__gpetHealItemMissingWarnMs) {
+                addLog(`Pet heal item "${window.__gpetHealItemId}" not found in inventory - skipping.`, 'error');
+                window.__gpetHealItemMissingLoggedAt = Date.now();
+            }
+            return;
+        }
+        window.__gpetHealLastUsedAt = Date.now();
+        window.__sendWS({ t: "inv.use", d: { bagSlot: slot }, q: ++window.__invUseSeq });
+        addLog(`Pet HP ${Math.round(pct)}% <= ${window.__gpetHealThresholdPct}% - using ${window.__gpetHealItemId} (bag slot ${slot}) on pet.`, 'info');
+    }
+    const GPET_HEAL_STORAGE_KEY = 'sb_gpet_heal_by_char';
+    function loadGpetHealConfig() {
+        try {
+            return JSON.parse(localStorage.getItem(GPET_HEAL_STORAGE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+    function saveGpetHealForChar() {
+        if (!window.__charId) return;
+        const cfg = loadGpetHealConfig();
+        cfg[window.__charId] = {
+            itemId: window.__gpetHealItemId,
+            thresholdPct: window.__gpetHealThresholdPct,
+        };
+        try {
+            localStorage.setItem(GPET_HEAL_STORAGE_KEY, JSON.stringify(cfg));
+        } catch (e) {
+            addLog('Could not save pet heal settings to localStorage.', 'error');
+        }
+    }
+    function restoreGpetHealForChar() {
+        if (!window.__charId) return;
+        const cfg = loadGpetHealConfig();
+        const saved = cfg[window.__charId];
+        if (!saved) return;
+        window.__gpetHealItemId = saved.itemId || null;
+        window.__gpetHealThresholdPct = typeof saved.thresholdPct === 'number' ? saved.thresholdPct : 50;
+        if (window.__gpetHealItemId) {
+            addLog(`Restored pet heal settings for this character: ${window.__gpetHealItemId} at <=${window.__gpetHealThresholdPct}%.`, 'info');
+        }
+        updateGpetPanel();
+    }
+    window.setGpetHealItem = function(itemId) {
+        window.__gpetHealItemId = (itemId || '').trim() || null;
+        saveGpetHealForChar();
+        addLog(window.__gpetHealItemId ? `Pet heal item set: ${window.__gpetHealItemId}` : 'Pet heal item cleared.', 'info');
+        updateGpetPanel();
+    };
+    window.setGpetHealThreshold = function(pct) {
+        const val = parseInt(pct, 10);
+        if (!isNaN(val)) {
+            window.__gpetHealThresholdPct = Math.min(100, Math.max(0, val));
+            saveGpetHealForChar();
+            addLog(`Pet heal threshold set: ${window.__gpetHealThresholdPct}%`, 'info');
+            updateGpetPanel();
+        }
+    };
     // ---- Per-character buff persistence (localStorage), same pattern as
     // the active-skills persistence below. ----
     const BUFFS_STORAGE_KEY = 'sb_active_buffs_by_char';
@@ -1667,6 +1924,103 @@
         savePartyBuffsForChar();
         addLog(`Party buff "${fullName}" weapon swap: ${entry.needsWeaponSwap ? 'ON' : 'OFF'}`, 'info');
     };
+    // ---- Revive skill list (localStorage, per-character) - same pattern as
+    // the party buff list above, just cast on dead members instead. ----
+    const REVIVE_SKILLS_STORAGE_KEY = 'sb_revive_skills_by_char';
+    function loadReviveSkillsConfig() {
+        try {
+            return JSON.parse(localStorage.getItem(REVIVE_SKILLS_STORAGE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+    function saveReviveSkillsForChar() {
+        if (!window.__charId) return;
+        const cfg = loadReviveSkillsConfig();
+        cfg[window.__charId] = window.__reviveSkills.map(s => ({ fullName: s.fullName, needsWeaponSwap: !!s.needsWeaponSwap }));
+        try {
+            localStorage.setItem(REVIVE_SKILLS_STORAGE_KEY, JSON.stringify(cfg));
+        } catch (e) {
+            addLog('Could not save revive skills to localStorage.', 'error');
+        }
+    }
+    function restoreReviveSkillsForChar() {
+        if (!window.__charId) return;
+        const cfg = loadReviveSkillsConfig();
+        const saved = cfg[window.__charId];
+        if (!Array.isArray(saved) || saved.length === 0) return;
+        window.__reviveSkills = [];
+        for (const entry of saved) {
+            if (!entry || !window.__knownSkills.includes(entry.fullName)) continue;
+            const { base, level } = extractSkillParts(entry.fullName);
+            if (level === 0 || window.__reviveSkills.some(s => s.base === base)) continue;
+            window.__reviveSkills.push({ base, level, fullName: entry.fullName, needsWeaponSwap: !!entry.needsWeaponSwap });
+        }
+        if (window.__reviveSkills.length > 0) {
+            addLog(`Restored ${window.__reviveSkills.length} revive skill(s) for this character.`, 'info');
+        }
+        updateReviveSkillsPanel();
+    }
+    window.addReviveSkill = function(fullName, needsWeaponSwap) {
+        const { base, level } = extractSkillParts(fullName);
+        if (level === 0) {
+            addLog(`Revive skill "${fullName}" has no level suffix - ignored.`, 'error');
+            return;
+        }
+        if (window.__reviveSkills.some(s => s.base === base)) {
+            addLog(`Revive skill "${base}" is already configured.`, 'info');
+            return;
+        }
+        window.__reviveSkills.push({ base, level, fullName, needsWeaponSwap: !!needsWeaponSwap });
+        window.__reviveSkills.sort((a, b) => a.base.localeCompare(b.base));
+        addLog(`Revive skill added: ${fullName}${needsWeaponSwap ? ' (needs weapon swap)' : ''}`, 'info');
+        saveReviveSkillsForChar();
+        updateReviveSkillsPanel();
+    };
+    window.removeReviveSkill = function(fullName) {
+        const idx = window.__reviveSkills.findIndex(s => s.fullName === fullName);
+        if (idx !== -1) {
+            const removed = window.__reviveSkills.splice(idx, 1)[0];
+            addLog(`Revive skill removed: ${removed.fullName}`, 'error');
+            saveReviveSkillsForChar();
+        } else {
+            addLog(`Revive skill "${fullName}" is not configured.`, 'info');
+        }
+        updateReviveSkillsPanel();
+    };
+    window.setReviveSkillNeedsSwap = function(fullName, needsSwap) {
+        const entry = window.__reviveSkills.find(s => s.fullName === fullName);
+        if (!entry) return;
+        entry.needsWeaponSwap = !!needsSwap;
+        saveReviveSkillsForChar();
+        addLog(`Revive skill "${fullName}" weapon swap: ${entry.needsWeaponSwap ? 'ON' : 'OFF'}`, 'info');
+    };
+    // Called when the game confirms a skill was learned to a new level
+    // (sys.notice/sys.skills.learned). skill.cast itself only ever sends the
+    // base groupId (see attack()/maintainBuffs()), so an outdated level here
+    // doesn't break casting - but it's still what's shown (skillLabel) and
+    // what gets persisted/restored per character, so bump it in place
+    // wherever that skill is currently configured.
+    function upgradeSkillReferences(newFullName) {
+        const { base, level } = extractSkillParts(newFullName);
+        if (level === 0) return;
+        const groups = [
+            { list: window.__activeSkills, save: saveActiveSkillsForChar, render: updateActiveSkillsPanel, label: 'Active skill' },
+            { list: window.__activeBuffs, save: saveActiveBuffsForChar, render: updateBuffStatusPanel, label: 'Buff' },
+            { list: window.__partyBuffs, save: savePartyBuffsForChar, render: updatePartyBuffsPanel, label: 'Party buff' },
+            { list: window.__reviveSkills, save: saveReviveSkillsForChar, render: updateReviveSkillsPanel, label: 'Revive skill' },
+        ];
+        for (const { list, save, render, label } of groups) {
+            const entry = list.find(s => s.base === base);
+            if (entry && entry.level < level) {
+                addLog(`${label} "${entry.fullName}" auto-upgraded to ${newFullName} (level ${entry.level} -> ${level}).`, 'info');
+                entry.fullName = newFullName;
+                entry.level = level;
+                save();
+                render();
+            }
+        }
+    }
     function getAvailableSkills() {
         if (window.__knownSkills.length === 0) {
             addLog('No known skills yet. Waiting for zone.init (log in / enter a zone)...', 'info');
@@ -1729,6 +2083,7 @@
             const isActive = window.__activeSkills.some(a => a.fullName === s);
             const isBuff = window.__activeBuffs.some(b => b.fullName === s);
             const isPartyBuff = window.__partyBuffs.some(b => b.fullName === s);
+            const isRevive = window.__reviveSkills.some(r => r.fullName === s);
             return `
                 <div class="sb-modal-skill-row">
                     <span class="sb-modal-skill-name" title="${s}">${skillLabel(s)}</span>
@@ -1736,6 +2091,7 @@
                         <button class="sb-modal-skill-btn ${isActive ? 'remove' : 'add'}" data-action="skill" data-skill="${s}">${isActive ? 'Remove' : 'Add'}</button>
                         <button class="sb-modal-skill-btn ${isBuff ? 'remove' : 'buff'}" data-action="buff" data-skill="${s}">${isBuff ? 'Remove Buff' : 'Add Buff'}</button>
                         <button class="sb-modal-skill-btn ${isPartyBuff ? 'remove' : 'buff'}" data-action="partybuff" data-skill="${s}">${isPartyBuff ? 'Remove Party Buff' : 'Add Party Buff'}</button>
+                        <button class="sb-modal-skill-btn ${isRevive ? 'remove' : 'buff'}" data-action="revive" data-skill="${s}">${isRevive ? 'Remove Revive' : 'Add Revive'}</button>
                     </span>
                 </div>
             `;
@@ -1759,6 +2115,14 @@
                         window.addPartyBuff(skill, false);
                     }
                     updatePartyBuffsPanel();
+                } else if (action === 'revive') {
+                    const isRevive = window.__reviveSkills.some(r => r.fullName === skill);
+                    if (isRevive) {
+                        window.removeReviveSkill(skill);
+                    } else {
+                        window.addReviveSkill(skill, false);
+                    }
+                    updateReviveSkillsPanel();
                 } else {
                     const isActive = window.__activeSkills.some(a => a.fullName === skill);
                     if (isActive) {
@@ -1852,12 +2216,14 @@
         }
         html += slots.map(({ item, idx }) => {
             const isBuff = window.__activeItemBuffs.some(i => i.itemId === item.itemId);
+            const isPetHeal = window.__gpetHealItemId === item.itemId;
             const qtyText = item.qty !== undefined ? ` x${item.qty}` : '';
             return `
                 <div class="sb-modal-skill-row">
                     <span class="sb-modal-skill-name">${item.itemId}${qtyText} <span class="panel-skill-timer">(slot ${idx})</span></span>
                     <span class="sb-modal-skill-btns">
                         <button class="sb-modal-skill-btn ${isBuff ? 'remove' : 'buff'}" data-item-buff="${item.itemId}">${isBuff ? 'Remove Buff' : 'Add Buff'}</button>
+                        <button class="sb-modal-skill-btn ${isPetHeal ? 'remove' : 'buff'}" data-pet-heal="${item.itemId}">${isPetHeal ? '✓ Pet Heal' : 'Pet Heal'}</button>
                         ${gearButtonHtml('primaryWeapon', item.itemId)}
                         ${gearButtonHtml('primaryShield', item.itemId)}
                         ${gearButtonHtml('weapon', item.itemId)}
@@ -1876,6 +2242,13 @@
                 } else {
                     window.addItemBuff(itemId);
                 }
+                renderInventoryModalBody();
+            });
+        });
+        body.querySelectorAll('[data-pet-heal]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const itemId = btn.getAttribute('data-pet-heal');
+                window.setGpetHealItem(window.__gpetHealItemId === itemId ? null : itemId);
                 renderInventoryModalBody();
             });
         });
@@ -1935,8 +2308,14 @@
     // node) - everything else (grade, distance, gather button) already
     // works for any npcId; unmapped ones just fall back to showing the
     // raw npcId in the Job tab instead of a friendly name.
+    // Only npcId keys listed here show up in the Job tab (see getJobNodes).
+    // node_mine is a best guess following the node_tree naming pattern and
+    // hasn't been confirmed against a real packet yet - if mining nodes
+    // don't show up, capture one via Debug -> Copy Packet Log and fix the
+    // key here.
     window.__jobNodeTypes = {
         node_tree: 'Lumberjack',
+        node_mine: 'Miner',
     };
     function getJobLabel(npcId) {
         return window.__jobNodeTypes[npcId] || npcId || 'Unknown';
@@ -1944,7 +2323,7 @@
     function getJobNodes() {
         const result = [];
         for (const [id, data] of Object.entries(window.__entityCache)) {
-            if (data.kind === 'npc' && data.npcId) {
+            if (data.kind === 'npc' && data.npcId && window.__jobNodeTypes.hasOwnProperty(data.npcId)) {
                 result.push({ id: parseInt(id, 10), ...data });
             }
         }
@@ -1995,6 +2374,11 @@
         for (const [idStr, data] of Object.entries(window.__entityCache)) {
             const id = parseInt(idStr, 10);
             if (id === window.__playerId || data.kind === 'player') continue;
+            // Job/gathering nodes (kind "npc") don't get 20s-timeout pruned
+            // like monsters do - they only disappear once actually
+            // gathered/depleted, which arrives separately via state.delta's
+            // "rem" list (see the state.delta handler).
+            if (data.kind === 'npc') continue;
             if (!data.lastSeen) {
                 data.lastSeen = now; // legacy entry without a timestamp yet
                 continue;
@@ -2032,6 +2416,7 @@
     // ============================================================
     function enqueuePickup(itemId) {
         const numId = typeof itemId === 'string' ? parseInt(itemId, 10) : itemId;
+        if (window.__lootOwnerLocked[numId]) return; // known not ours - see ERR_OWNER_LOCK handler
         if (!window.__pickupQueue.includes(numId)) {
             window.__pickupQueue.push(numId);
             addLog(`Item ${numId} added to loot queue`, 'loot');
@@ -2239,7 +2624,50 @@
             ? Math.round((mp / maxMp) * 100) : null;
         const low = hpPct !== null && hpPct <= 25;
         el.className = `panel-status-line ${low ? 'status-error' : 'status-ok'}`;
-        el.textContent = `HP: ${hp ?? '?'}/${maxHp ?? '?'}${hpPct !== null ? ` (${hpPct}%)` : ''}   MP: ${mp ?? '?'}/${maxMp ?? '?'}${mpPct !== null ? ` (${mpPct}%)` : ''}`;
+        const levelText = window.__playerLevel !== null ? `Lv.${window.__playerLevel}   ` : '';
+        el.textContent = `${levelText}HP: ${hp ?? '?'}/${maxHp ?? '?'}${hpPct !== null ? ` (${hpPct}%)` : ''}   MP: ${mp ?? '?'}/${maxMp ?? '?'}${mpPct !== null ? ` (${mpPct}%)` : ''}`;
+    }
+    // Fixed XP/SP display (Main tab), updated from progress.update instead
+    // of only being logged.
+    function updateProgressDisplay() {
+        const el = document.getElementById('sb-status-progress');
+        if (!el) return;
+        if (window.__xp === null && window.__sp === null) {
+            el.textContent = 'Progress: waiting for data...';
+            return;
+        }
+        const xpPct = (window.__xpToNext > 0) ? Math.round((window.__xp / window.__xpToNext) * 100) : 0;
+        const spPct = (window.__spExpToNext > 0) ? Math.round((window.__spExp / window.__spExpToNext) * 100) : 0;
+        el.textContent = `XP: ${window.__xp ?? '?'}/${window.__xpToNext ?? '?'} (${xpPct}%)   SP: ${window.__sp ?? '?'} (${window.__spExp ?? '?'}/${window.__spExpToNext ?? '?'}, ${spPct}%)`;
+    }
+    // Pet tab: fixed status line (active/level/hp) + heal item/threshold
+    // summary, updated in place like updateVitalsDisplay above.
+    function updateGpetPanel() {
+        const statusEl = document.getElementById('sb-gpet-status');
+        if (statusEl) {
+            const pet = window.__gpet;
+            if (!pet.petId) {
+                statusEl.textContent = 'No pet data yet (spawn/summon a growth pet to see it here).';
+                statusEl.className = 'panel-status-line';
+            } else {
+                const hpPct = (typeof pet.hp === 'number' && typeof pet.maxHp === 'number' && pet.maxHp > 0)
+                    ? Math.round((pet.hp / pet.maxHp) * 100) : null;
+                const stateText = pet.dead ? 'Dead' : (pet.active ? 'Active' : 'Inactive');
+                statusEl.className = `panel-status-line ${pet.dead ? 'status-error' : (pet.active ? 'status-ok' : '')}`;
+                statusEl.textContent = `${pet.petId} - ${stateText}   Lv.${pet.level ?? '?'}   HP: ${pet.hp ?? '?'}/${pet.maxHp ?? '?'}${hpPct !== null ? ` (${hpPct}%)` : ''}`;
+            }
+        }
+        const healEl = document.getElementById('sb-gpet-heal-item-status');
+        if (healEl) {
+            healEl.textContent = window.__gpetHealItemId
+                ? `Heal item: ${window.__gpetHealItemId} - used automatically when pet HP drops to ${window.__gpetHealThresholdPct}% or below.`
+                : 'No heal item configured - pick one from the Inventory modal below.';
+        }
+        const thresholdInput = document.getElementById('sb-gpet-heal-threshold-input');
+        if (thresholdInput && document.activeElement !== thresholdInput) {
+            thresholdInput.value = window.__gpetHealThresholdPct;
+        }
+        if (document.getElementById('sb-inventory-modal')) renderInventoryModalBody();
     }
     function logSpecial(msg) {
         // ERR_NOT_FOUND
@@ -2255,7 +2683,84 @@
                     window.__skillIndex = 0;
                     addLog('Combat cancelled - target not found', 'error');
                 }
+            } else if (window.__currentPickupId !== null) {
+                // Bare shape (no targetId) - confirmed via capture to be
+                // what loot.pickup gets back for an item that's already
+                // gone. This game auto-loots ground items on walkover
+                // independent of our queue, so by the time a queued item's
+                // turn comes up it can easily already be gone - "not found"
+                // is a permanent answer, not a transient one, so there's no
+                // point burning through the usual 3-attempt/12s retry cycle
+                // (that's what was causing the queue to crawl). Drop it now.
+                const itemId = window.__currentPickupId;
+                addLog(`Item ${itemId} not found - skipping.`, 'loot');
+                if (window.__pickupTimer) {
+                    clearTimeout(window.__pickupTimer);
+                    window.__pickupTimer = null;
+                }
+                if (window.__pickupQueue.length > 0 && window.__pickupQueue[0] === itemId) {
+                    window.__pickupQueue.shift();
+                }
+                delete window.__pickupRetries[itemId];
+                delete window.__entityCache[itemId];
+                window.__currentPickupId = null;
+                processPickupQueue();
             }
+            return true;
+        }
+        // ERR_DEAD - self is dead. Attacking, looting, casting, gathering -
+        // none of it works while dead, so pause the bot loop entirely
+        // instead of hammering the same failing action every tick.
+        // window.__playerDead is cleared once vitals.update reports hp > 0
+        // again (there's no dedicated "you were revived" packet confirmed
+        // yet).
+        if (msg.t === 'err' && msg.d && msg.d.code === 'ERR_DEAD') {
+            if (!window.__playerDead) {
+                window.__playerDead = true;
+                addLog('You are dead - pausing bot actions until revived.', 'error');
+            }
+            window.__currentTarget = null;
+            window.__isFighting = false;
+            window.__skillIndex = 0;
+            return true;
+        }
+        // ERR_OWNER_LOCK - confirmed via capture: the ground item is
+        // loot-locked to whoever's entitled to it (the killer, or their
+        // party if item share is on) - not us. Carries no identifying info,
+        // same shape as ERR_COOLDOWN ({ code }) - but since only one
+        // loot.pickup is ever in flight at a time (see processPickupQueue),
+        // it unambiguously refers to window.__currentPickupId. Drop it
+        // immediately instead of burning through the timeout retries, and
+        // remember it so a re-announced copy of the same ground item isn't
+        // just queued and rejected again.
+        if (msg.t === 'err' && msg.d && msg.d.code === 'ERR_OWNER_LOCK') {
+            const itemId = window.__currentPickupId;
+            if (itemId !== null) {
+                window.__lootOwnerLocked[itemId] = true;
+                addLog(`Item ${itemId} is owner-locked (not ours to loot) - skipping.`, 'loot');
+                if (window.__pickupTimer) {
+                    clearTimeout(window.__pickupTimer);
+                    window.__pickupTimer = null;
+                }
+                if (window.__pickupQueue.length > 0 && window.__pickupQueue[0] === itemId) {
+                    window.__pickupQueue.shift();
+                }
+                delete window.__pickupRetries[itemId];
+                window.__currentPickupId = null;
+                processPickupQueue();
+            }
+            return true;
+        }
+        // revive.offer - someone successfully cast a revive skill on us
+        // while dead (confirmed round trip: their skill.fire is immediately
+        // followed by this in the same batch). Doesn't take effect on its
+        // own - the target has to explicitly accept via revive.respond, so
+        // auto-accept right away instead of leaving the character sitting
+        // dead. window.__playerDead itself is cleared separately once
+        // vitals.update reports hp > 0.
+        if (msg.t === 'revive.offer' && msg.d && msg.d.offerId !== undefined) {
+            addLog(`Revive offer from ${msg.d.casterName || msg.d.casterId} - accepting.`, 'info');
+            window.__sendWS({ t: 'revive.respond', d: { offerId: msg.d.offerId, accept: true } });
             return true;
         }
         // cast.ok - confirms a skill.cast succeeded and, crucially, tells us
@@ -2358,7 +2863,33 @@
         if (msg.t === 'vitals.update' && msg.d) {
             window.__hp = msg.d.hp;
             window.__mp = msg.d.mp;
+            if (window.__playerDead && typeof window.__hp === 'number' && window.__hp > 0) {
+                window.__playerDead = false;
+                addLog('Revived - resuming bot actions.', 'info');
+            }
             updateVitalsDisplay();
+            return true;
+        }
+        // gpet.state - growth pet snapshot (active/level/hp/maxHp/...).
+        // Fixed display like vitals.update, plus drives the auto-heal item.
+        if (msg.t === 'gpet.state' && msg.d) {
+            window.__gpet = {
+                active: !!msg.d.active,
+                petId: msg.d.petId ?? null,
+                entityId: msg.d.entityId ?? null,
+                bagSlot: msg.d.bagSlot ?? null,
+                level: msg.d.level ?? null,
+                xp: msg.d.xp ?? null,
+                xpToNext: msg.d.xpToNext ?? null,
+                hp: msg.d.hp ?? null,
+                maxHp: msg.d.maxHp ?? null,
+                hgp: msg.d.hgp ?? null,
+                hgpMax: msg.d.hgpMax ?? null,
+                dead: !!msg.d.dead,
+                mode: msg.d.mode ?? null,
+            };
+            updateGpetPanel();
+            maybeHealGpet();
             return true;
         }
         // buffs.update - current buff list for an entity. Only tracked for
@@ -2387,6 +2918,7 @@
             const { maxHp, maxMp } = getMaxValues(self);
             if (maxHp !== undefined) window.__maxHp = maxHp;
             if (maxMp !== undefined) window.__maxMp = maxMp;
+            if (self.level !== undefined) setPlayerLevel(self.level);
             if (self.entityId) {
                 window.__playerId = typeof self.entityId === 'string' ? parseInt(self.entityId, 10) : self.entityId;
                 cacheEntity({ id: window.__playerId, name: self.name, kind: 'player' });
@@ -2401,6 +2933,21 @@
                     bag: Array.isArray(self.inventory.bag) ? self.inventory.bag : [],
                     equip: self.inventory.equip || {}
                 };
+            }
+            if (Array.isArray(self.masteries)) {
+                window.__masteries = self.masteries;
+                // Auto-restore this character's auto-mastery checkboxes, but
+                // only once per session per character (zone.init also fires
+                // on zone changes, not just character selection) - same
+                // guard pattern as the skill loadout restore below.
+                if (window.__charId && window.__masteriesRestoredForCharId !== window.__charId) {
+                    restoreAutoMasteriesForChar();
+                    window.__masteriesRestoredForCharId = window.__charId;
+                    // Covers a mastery that fell behind while its checkbox
+                    // was already on from a previous session.
+                    window.__autoMasteryIds.forEach(id => catchUpMastery(id));
+                }
+                updateMasteriesPanel();
             }
             updateVitalsDisplay();
             if (Array.isArray(msg.d.entities)) {
@@ -2419,13 +2966,19 @@
                     restoreActiveItemBuffsForChar();
                     restoreWeaponSettingsForChar();
                     restorePartyBuffsForChar();
+                    restoreReviveSkillsForChar();
+                    restorePassiveModeForChar();
+                    restoreGpetHealForChar();
                     window.__skillsRestoredForCharId = window.__charId;
                 }
             }
             updateStatus();
             return false;
         }
-        // progress.update - compact output
+        // progress.update - compact output, also feeds the fixed Main tab
+        // display (updateProgressDisplay). Confirmed via capture to never
+        // carry a "level" field (that comes from progress.levelUp instead,
+        // see below) - xp/sp only.
         if (msg.t === 'progress.update' && msg.d) {
             const xp = msg.d.xp ?? '?';
             const xpToNext = msg.d.xpToNext ?? 1;
@@ -2435,6 +2988,22 @@
             const xpPercent = xpToNext > 0 ? Math.round((xp / xpToNext) * 100) : 0;
             const spPercent = spExpToNext > 0 ? Math.round((spExp / spExpToNext) * 100) : 0;
             addLog(`XP: ${xp}/${xpToNext} (${xpPercent}%)  SP: ${sp} (${spExp}/${spExpToNext}, ${spPercent}%)`, 'xp');
+            window.__xp = msg.d.xp ?? window.__xp;
+            window.__xpToNext = msg.d.xpToNext ?? window.__xpToNext;
+            window.__sp = msg.d.sp ?? window.__sp;
+            window.__spExp = msg.d.spExp ?? window.__spExp;
+            window.__spExpToNext = msg.d.spExpToNext ?? window.__spExpToNext;
+            updateProgressDisplay();
+            return true;
+        }
+        // progress.levelUp - confirmed via capture: { level, statPoints },
+        // fired the tick the kill that pushed xp over the threshold lands
+        // (same batch as combat.death/progress.update/stats.update/
+        // fx.levelUp for that kill). This is what actually drives
+        // setPlayerLevel()'s level-up detection (auto-mastery raises, Main
+        // tab level display) - zone.init's self.level only covers login.
+        if (msg.t === 'progress.levelUp' && msg.d && typeof msg.d.level === 'number') {
+            setPlayerLevel(msg.d.level);
             return true;
         }
         // combat.death
@@ -2530,6 +3099,22 @@
             if (msg.d.key === 'sys.profession.level_up' && msg.d.params) {
                 addLog(`${msg.d.params.profession} leveled up to ${msg.d.params.level}!`, 'xp');
             }
+            // Confirms a manually-learned skill (params.skillId is the full
+            // "<base>_<level>" name of the level just learned) - bump it in
+            // place wherever it's already configured (active skill/buff/
+            // party buff) so those don't keep pointing at the old level.
+            if (msg.d.key === 'sys.skills.learned' && msg.d.params && msg.d.params.skillId) {
+                upgradeSkillReferences(msg.d.params.skillId);
+            }
+            return true;
+        }
+        // skills.update - full list of learned skills (every level ever
+        // learned, not just the highest per base). Keep our copy fresh so
+        // the Available Skills modal doesn't need a fresh zone.init to see
+        // a skill just learned this session.
+        if (msg.t === 'skills.update' && msg.d && Array.isArray(msg.d.known)) {
+            window.__knownSkills = msg.d.known;
+            if (document.getElementById('sb-skills-modal')) renderSkillsModalBody();
             return true;
         }
         // state.delta - cache update
@@ -2559,10 +3144,16 @@
             // fallback in case a different server build uses that name.
             const removeIds = msg.d.rem || msg.d.remove;
             if (Array.isArray(removeIds)) {
-                for (const id of removeIds) {
-                    const numId = typeof id === 'string' ? parseInt(id, 10) : id;
+                const numIds = removeIds.map(id => typeof id === 'string' ? parseInt(id, 10) : id);
+                for (const numId of numIds) {
                     delete window.__entityCache[numId];
+                    delete window.__lootOwnerLocked[numId];
                 }
+                // Remembered so the entity.pickup handler (fires for every
+                // pickup, ours or auto-looted on walkover - see there) can
+                // tell whether this particular removal was actually our
+                // queued item.
+                window.__lastRemIds = numIds;
                 updateMonsterPanel();
                 updateJobPanel();
             }
@@ -2572,10 +3163,17 @@
         if (msg.t === 'quest.progress' || msg.t === 'progress.gainFx') {
             return true;
         }
-        // entity.pickup
+        // entity.pickup - confirmed via capture to fire for ANY item the
+        // player picks up, including ones auto-looted on walkover that we
+        // never sent a loot.pickup for (no itemId on this event to tell
+        // them apart). Only treat it as confirming our own queued pickup if
+        // the item we're actually waiting on was in the same batch's
+        // state.delta "rem" list (rem always accompanies the real removal,
+        // ours or auto) - otherwise leave the queue/timer alone, since it's
+        // an unrelated pickup.
         if (msg.t === 'entity.pickup' && msg.d && msg.d.id) {
             const id = typeof msg.d.id === 'string' ? parseInt(msg.d.id, 10) : msg.d.id;
-            if (id === window.__playerId) {
+            if (id === window.__playerId && window.__currentPickupId !== null && window.__lastRemIds.includes(window.__currentPickupId)) {
                 addLog('Item picked up.', 'loot');
                 onPickupSuccess();
             }
@@ -2832,6 +3430,7 @@
             const closest = findClosestMonster();
             if (!closest) {
                 addLog('No monster found nearby.', 'error');
+                roamRandomly();
                 return;
             }
             id = closest.id;
@@ -2846,6 +3445,7 @@
             const closest = findClosestMonster();
             if (!closest) {
                 addLog('No monster found nearby.', 'error');
+                roamRandomly();
                 return;
             }
             id = closest.id;
@@ -2913,6 +3513,7 @@
             const closest = findClosestMonster();
             if (!closest) {
                 addLog('No monster found nearby.', 'error');
+                roamRandomly();
                 return;
             }
             id = closest.id;
@@ -2936,6 +3537,26 @@
         window.__sendWS({ t: "move.click", d: { x, z } });
         addLog(`Moving to (${x?.toFixed(2)}, ${z?.toFixed(2)})`, 'info');
     };
+    // Called wherever attack()/basicAttack() give up on "no monster nearby"
+    // - wanders to a random point instead of just sitting still waiting for
+    // something to spawn. Only while the bot loop is actually running (not
+    // on a manual attack()/Debug button press with nothing around), and
+    // throttled to __roamIntervalMs so it doesn't fire a new move.click
+    // every single tick while the area stays empty.
+    function roamRandomly() {
+        if (!window.__botLoopActive) return;
+        const now = Date.now();
+        if (now - window.__lastRoamAt < window.__roamIntervalMs) return;
+        window.__lastRoamAt = now;
+        const center = window.__botCenter || window.__playerPos;
+        const radius = window.__botRadius > 0 ? window.__botRadius : window.__roamRadiusFallback;
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * radius;
+        const x = center.x + Math.cos(angle) * dist;
+        const z = center.z + Math.sin(angle) * dist;
+        addLog(`No monster nearby - wandering to (${x.toFixed(1)}, ${z.toFixed(1)}).`, 'info');
+        window.moveTo(x, z);
+    }
     // Starts gathering a job node (tree, ore, ...). Confirmed packet format:
     // { t: "gather.start", d: { nodeId } }. Progress comes back as repeating
     // gather.action/gather.yield packets, and gather.end marks the finish
@@ -3254,9 +3875,43 @@
         }
         return true;
     }
+    // ---- Passive mode ("buff the party, never attack/loot") ----
+    // Per-character, not global (unlike radius/return-to-center) - some
+    // characters on the same account are meant to fight, others are meant
+    // to just stand there buffing, so this has to travel with charId like
+    // the skill/buff loadouts do.
+    const PASSIVE_MODE_STORAGE_KEY = 'sb_passive_mode_by_char';
+    function loadPassiveModeConfig() {
+        try {
+            return JSON.parse(localStorage.getItem(PASSIVE_MODE_STORAGE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+    function savePassiveModeForChar() {
+        if (!window.__charId) return;
+        const cfg = loadPassiveModeConfig();
+        cfg[window.__charId] = window.__passiveMode;
+        try {
+            localStorage.setItem(PASSIVE_MODE_STORAGE_KEY, JSON.stringify(cfg));
+        } catch (e) {
+            addLog('Could not save passive mode setting to localStorage.', 'error');
+        }
+    }
+    function restorePassiveModeForChar() {
+        if (!window.__charId) return;
+        const cfg = loadPassiveModeConfig();
+        window.__passiveMode = !!cfg[window.__charId];
+        const checkbox = document.getElementById('sb-passive-mode-checkbox');
+        if (checkbox) checkbox.checked = window.__passiveMode;
+        if (window.__passiveMode) addLog('Passive mode restored: ON (this character will not attack or loot).', 'info');
+    }
     function botLoopTick() {
         if (!window.__botLoopActive) return;
         if (!isOpen(window.__ws)) return;
+        // Dead: attacking, looting, and casting all fail server-side (see
+        // the ERR_DEAD handler in logSpecial) - do nothing until revived.
+        if (window.__playerDead) return;
         // Keep self-buffs, item buffs, and party buffs up regardless of
         // what else is happening this tick. Returns true while gear is
         // being swapped for a buff (or held in buff gear across several
@@ -3264,6 +3919,9 @@
         // inv.move and silently breaks the swap, so we hold off until
         // maintainBuffs() reports it's done and back on normal gear.
         const buffsBusy = maintainBuffs();
+        // Passive mode: support characters that should only buff the party,
+        // never loot or attack anything - stop right here every tick.
+        if (window.__passiveMode) return;
         // Looting takes priority over attacking. Sending an attack while a
         // pickup is in flight appears to redirect the player's movement
         // away from the loot item, so the pickup never actually completes.
@@ -3295,7 +3953,8 @@
         const c = window.__botCenter;
         const radiusText = window.__botRadius > 0 ? `radius ${window.__botRadius}` : 'no radius limit';
         const stuckText = window.__stuckState !== 'idle' ? `, ${window.__stuckState === 'probing' ? 'dodging obstacle' : 'returning to center'}` : '';
-        el.textContent = `Leveling area: (${c.x.toFixed(1)}, ${c.z.toFixed(1)}), ${radiusText}${stuckText}`;
+        const passiveText = window.__passiveMode ? ', passive (buffs only)' : '';
+        el.textContent = `Leveling area: (${c.x.toFixed(1)}, ${c.z.toFixed(1)}), ${radiusText}${stuckText}${passiveText}`;
     }
     window.startBot = function() {
         if (window.__botLoopActive) {
@@ -3308,6 +3967,9 @@
         const returnCheckbox = document.getElementById('sb-return-center-checkbox');
         window.__returnToCenterOnStuck = returnCheckbox ? !!returnCheckbox.checked : window.__returnToCenterOnStuck;
         saveBotSettings();
+        const passiveCheckbox = document.getElementById('sb-passive-mode-checkbox');
+        window.__passiveMode = passiveCheckbox ? !!passiveCheckbox.checked : window.__passiveMode;
+        savePassiveModeForChar();
         // Center is always captured fresh from the current position - "here
         // is where I want to level" is exactly where the button was pressed.
         window.__botCenter = { x: window.__playerPos.x, z: window.__playerPos.z };
@@ -3315,7 +3977,8 @@
         resetStuckState();
         window.__botLoopActive = true;
         const radiusMsg = window.__botRadius > 0 ? `within a ${window.__botRadius} radius of (${window.__botCenter.x.toFixed(1)}, ${window.__botCenter.z.toFixed(1)})` : 'with no radius limit';
-        addLog(`Bot loop started (interval ${window.__botLoopIntervalMs}ms). Leveling ${radiusMsg}. Attacks the current or nearest target in range and loots automatically.`, 'info');
+        const modeMsg = window.__passiveMode ? 'Passive mode: keeping buffs up only, will not attack or loot.' : 'Attacks the current or nearest target in range and loots automatically.';
+        addLog(`Bot loop started (interval ${window.__botLoopIntervalMs}ms). Leveling ${radiusMsg}. ${modeMsg}`, 'info');
         updateBotLoopButton();
         updateLevelingStatusLine();
         window.__botLoopTimer = setInterval(botLoopTick, window.__botLoopIntervalMs);
@@ -3545,6 +4208,31 @@
             btn.addEventListener('click', () => window.removePartyBuff(btn.getAttribute('data-buff')));
         });
     }
+    function updateReviveSkillsPanel() {
+        const el = document.getElementById('sb-reviveskills-list');
+        if (!el) return;
+        if (window.__reviveSkills.length === 0) {
+            el.innerHTML = `<div class="panel-list-empty">No revive skill configured.</div>`;
+            return;
+        }
+        el.innerHTML = window.__reviveSkills.map(s => `
+            <div class="panel-skill-row">
+                <span class="panel-skill-name" title="${s.fullName}">${skillLabel(s.fullName)}</span>
+                <label style="display:flex;align-items:center;gap:3px;flex-shrink:0;color:#999;">
+                    <input type="checkbox" class="reviveskill-swap-toggle" data-skill="${s.fullName}" ${s.needsWeaponSwap ? 'checked' : ''} /> swap
+                </label>
+                <button class="panel-skill-remove-btn" data-skill="${s.fullName}">Remove</button>
+            </div>
+        `).join('');
+        el.querySelectorAll('.reviveskill-swap-toggle').forEach(cb => {
+            cb.addEventListener('change', (e) => {
+                window.setReviveSkillNeedsSwap(cb.getAttribute('data-skill'), e.target.checked);
+            });
+        });
+        el.querySelectorAll('.panel-skill-remove-btn').forEach(btn => {
+            btn.addEventListener('click', () => window.removeReviveSkill(btn.getAttribute('data-skill')));
+        });
+    }
     // Reflects window.__currentParty in the GUI: status line, and the
     // create button flips into a "Leave Party" button while one is active
     // (the server refuses party.create/party.match register while you're
@@ -3678,6 +4366,7 @@
             <span>${window.__isFighting ? 'In combat' : 'Idle'}</span>
             <span>${skills} skill(s)</span>
             <span>${queue} item(s) queued</span>
+            ${window.__playerDead ? '<span class="status-error">Dead - paused</span>' : ''}
             <span class="${connected ? 'status-ok' : 'status-error'}">
                 ${connected ? 'Connected' : 'Disconnected'}
             </span>
@@ -3699,6 +4388,7 @@
         updateActiveSkillsPanel();
         updateItemBuffsPanel();
         updateLevelingStatusLine();
+        updateGpetPanel();
     }
     // ============================================================
     //  13. MAIN PANEL
@@ -3716,13 +4406,49 @@
                 <span class="panel-close" id="sb-panel-close">&times;</span>
             </div>
             <div class="panel-tabs">
-                <button class="panel-tab-btn active" data-tab="skills">Skills</button>
+                <button class="panel-tab-btn active" data-tab="main">Main</button>
+                <button class="panel-tab-btn" data-tab="training">Training Area</button>
+                <button class="panel-tab-btn" data-tab="skills">Skills</button>
+                <button class="panel-tab-btn" data-tab="pet">Pet</button>
                 <button class="panel-tab-btn" data-tab="party">Party</button>
                 <button class="panel-tab-btn" data-tab="weapon">Weapon</button>
                 <button class="panel-tab-btn" data-tab="job">Job</button>
                 <button class="panel-tab-btn" data-tab="debug">Debug</button>
             </div>
-            <div class="panel-tab-content active" data-tab-content="skills">
+            <div class="panel-tab-content active" data-tab-content="main">
+                <div class="panel-status-line" id="sb-status-vitals">Vitals: waiting for data...</div>
+                <div class="panel-status-line" id="sb-status-progress">Progress: waiting for data...</div>
+                <div class="panel-status" id="sb-status">
+                    <span>Initializing...</span>
+                </div>
+                <div class="panel-section-title">Auto Masteries (raise 1 point on level up)</div>
+                <div class="panel-skill-list" id="sb-masteries-list">
+                    <div class="panel-list-empty">No mastery data yet.</div>
+                </div>
+                <div class="panel-section-title">Log</div>
+                <div class="panel-buttons">
+                    <button id="sb-btn-clear">Clear Log</button>
+                </div>
+                <div class="panel-log" id="sb-log-content"></div>
+            </div>
+            <div class="panel-tab-content" data-tab-content="training">
+                <div class="panel-section-title">Leveling Area (set on Start Bot)</div>
+                <div class="panel-input-row">
+                    <label>Radius</label>
+                    <input type="number" id="sb-radius-input" placeholder="0 = unlimited" min="0" step="50" />
+                </div>
+                <div class="panel-checkbox-row">
+                    <label><input type="checkbox" id="sb-return-center-checkbox" /> If stuck too long, return to center instead of dodging</label>
+                </div>
+                <div class="panel-checkbox-row">
+                    <label><input type="checkbox" id="sb-passive-mode-checkbox" /> Passive mode - keep buffs up, never attack or loot (party support characters)</label>
+                </div>
+                <div class="panel-status-line" id="sb-status-leveling">Leveling area: not set (starts fresh from wherever Start Bot is pressed).</div>
+                <div class="panel-buttons">
+                    <button class="primary" id="sb-btn-toggle-bot">Start Bot</button>
+                </div>
+            </div>
+            <div class="panel-tab-content" data-tab-content="skills">
                 <div class="panel-buttons">
                     <button id="sb-btn-available-skills">Available Skills</button>
                     <button id="sb-btn-inventory">Inventory</button>
@@ -3738,6 +4464,20 @@
                 <div class="panel-section-title">Active Item Buffs</div>
                 <div class="panel-skill-list" id="sb-active-itembuffs-list">
                     <div class="panel-list-empty">No active item buffs.</div>
+                </div>
+            </div>
+            <div class="panel-tab-content" data-tab-content="pet">
+                <div class="panel-section-title">Growth Pet (gpet)</div>
+                <div class="panel-status-line" id="sb-gpet-status">No pet data yet.</div>
+                <div class="panel-section-title">Auto-heal</div>
+                <div class="panel-status-line" id="sb-gpet-heal-item-status">No heal item configured.</div>
+                <div class="panel-input-row">
+                    <label>Heal at</label>
+                    <input type="number" id="sb-gpet-heal-threshold-input" min="0" max="100" step="5" value="50" />
+                    <label style="min-width:auto;">% HP</label>
+                </div>
+                <div class="panel-buttons">
+                    <button id="sb-btn-gpet-heal-item-choose">Choose Heal Item from Inventory...</button>
                 </div>
             </div>
             <div class="panel-tab-content" data-tab-content="party">
@@ -3778,6 +4518,13 @@
                 <div class="panel-buttons">
                     <button id="sb-btn-partybuff-choose">Choose from Available Skills...</button>
                     <button id="sb-btn-buffparty-now">Buff Party Now</button>
+                </div>
+                <div class="panel-section-title">Revive Skill (auto-cast on dead party members in range - see Weapon tab for gear)</div>
+                <div class="panel-skill-list" id="sb-reviveskills-list">
+                    <div class="panel-list-empty">No revive skill configured.</div>
+                </div>
+                <div class="panel-buttons">
+                    <button id="sb-btn-revive-choose">Choose from Available Skills...</button>
                 </div>
             </div>
             <div class="panel-tab-content" data-tab-content="weapon">
@@ -3836,6 +4583,19 @@
                     <button id="sb-btn-add-itembuff">Add</button>
                     <button id="sb-btn-remove-itembuff">Remove</button>
                 </div>
+                <div class="panel-checkbox-row">
+                    <label><input type="checkbox" id="sb-monster-radar-toggle" /> Show Monster Radar window</label>
+                </div>
+                <div class="panel-section-title">Custom Package</div>
+                <div class="panel-input-row">
+                    <label>Type</label>
+                    <input type="text" id="sb-custom-pkg-type" placeholder="e.g. loot.pickup" />
+                </div>
+                <div class="panel-input-row">
+                    <label>Data</label>
+                    <input type="text" id="sb-custom-pkg-data" placeholder='JSON, e.g. {"id": 12345}' />
+                    <button id="sb-btn-custom-pkg-send">Send</button>
+                </div>
                 <div class="panel-buttons">
                     <button id="sb-btn-reconnect">Rescan WS</button>
                     <button id="sb-btn-debug">Debug: OFF</button>
@@ -3845,25 +4605,9 @@
                 </div>
                 <div class="panel-status-line" id="sb-status-ws">Looking for a WebSocket...</div>
             </div>
-            <div class="panel-section-title">Leveling Area (set on Start Bot)</div>
-            <div class="panel-input-row">
-                <label>Radius</label>
-                <input type="number" id="sb-radius-input" placeholder="0 = unlimited" min="0" step="50" />
-            </div>
-            <div class="panel-checkbox-row">
-                <label><input type="checkbox" id="sb-return-center-checkbox" /> If stuck too long, return to center instead of dodging</label>
-            </div>
-            <div class="panel-status-line" id="sb-status-leveling">Leveling area: not set (starts fresh from wherever Start Bot is pressed).</div>
             <div class="panel-buttons">
-                <button class="primary" id="sb-btn-toggle-bot">Start Bot</button>
-                <button id="sb-btn-clear">Clear Log</button>
                 <button class="danger" id="sb-btn-panel-hide">Hide</button>
             </div>
-            <div class="panel-log" id="sb-log-content"></div>
-            <div class="panel-status" id="sb-status">
-                <span>Initializing...</span>
-            </div>
-            <div class="panel-status-line" id="sb-status-vitals">Vitals: waiting for data...</div>
         `;
         document.body.appendChild(panel);
 
@@ -3892,6 +4636,11 @@
             window.__returnToCenterOnStuck = e.target.checked;
             saveBotSettings();
             addLog(`Return-to-center on stuck: ${window.__returnToCenterOnStuck ? 'ON' : 'OFF'}`, 'info');
+        });
+        document.getElementById('sb-passive-mode-checkbox').addEventListener('change', (e) => {
+            window.__passiveMode = e.target.checked;
+            savePassiveModeForChar();
+            addLog(`Passive mode: ${window.__passiveMode ? 'ON (will not attack or loot)' : 'OFF'}`, 'info');
         });
         document.getElementById('sb-btn-attack').addEventListener('click', () => {
             window.attack();
@@ -4009,6 +4758,34 @@
                 input.value = '';
             }
         });
+        document.getElementById('sb-monster-radar-toggle').addEventListener('change', (e) => {
+            window.setMonsterRadarVisible(e.target.checked);
+        });
+        document.getElementById('sb-btn-custom-pkg-send').addEventListener('click', () => {
+            const typeInput = document.getElementById('sb-custom-pkg-type');
+            const dataInput = document.getElementById('sb-custom-pkg-data');
+            const type = typeInput.value.trim();
+            if (!type) {
+                addLog('Custom package: type is required.', 'error');
+                return;
+            }
+            let data = {};
+            const raw = dataInput.value.trim();
+            if (raw) {
+                try {
+                    data = JSON.parse(raw);
+                } catch (err) {
+                    addLog(`Custom package: invalid JSON data (${err.message}).`, 'error');
+                    return;
+                }
+            }
+            if (window.__sendWS({ t: type, d: data })) {
+                addLog(`Custom package sent: ${type} ${JSON.stringify(data)}`, 'info');
+            }
+        });
+        document.getElementById('sb-custom-pkg-data').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') document.getElementById('sb-btn-custom-pkg-send').click();
+        });
         document.getElementById('sb-move-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') document.getElementById('sb-btn-move').click();
         });
@@ -4067,15 +4844,24 @@
         document.getElementById('sb-btn-buffgear-choose').addEventListener('click', () => {
             showInventoryModal();
         });
+        document.getElementById('sb-btn-gpet-heal-item-choose').addEventListener('click', () => {
+            showInventoryModal();
+        });
+        document.getElementById('sb-gpet-heal-threshold-input').addEventListener('change', (e) => {
+            window.setGpetHealThreshold(e.target.value);
+        });
         document.getElementById('sb-btn-partybuff-choose').addEventListener('click', () => {
             getAvailableSkills();
         });
         document.getElementById('sb-btn-buffparty-now').addEventListener('click', () => {
             window.buffPartyNow();
         });
+        document.getElementById('sb-btn-revive-choose').addEventListener('click', () => {
+            getAvailableSkills();
+        });
 
         addLog('Bot helper started.', 'info');
-        addLog('Commands: attack(), basicAttack(), addSkill("name"), addBuff("name"), showBuffs(), addItemBuff("itemId"), removeItemBuff("itemId"), getAvailableSkills(), moveTo(x,z), pickup(id), gatherNode(nodeId), addToPartyWhitelist("name"), removeFromPartyWhitelist("name"), addBuff("name", needsWeaponSwap), setBuffNeedsSwap("name", bool), addPartyBuff("name", needsWeaponSwap), removePartyBuff("name"), setPartyBuffNeedsSwap("name", bool), setPrimaryWeapon(itemId), setPrimaryShield(itemId), setBuffWeapon(itemId), setBuffShield(itemId), buffPartyNow(), showWsStatus(), toggleDebug(), exportPacketLog(), copyPacketLog(), startBot(), stopBot(), clearMonsterCache(), createParty(expShare, itemShare), leaveParty(), registerPartyMatch("title"), respondToPartyApplication(charId, accept)', 'info');
+        addLog('Commands: attack(), basicAttack(), addSkill("name"), addBuff("name"), showBuffs(), addItemBuff("itemId"), removeItemBuff("itemId"), getAvailableSkills(), moveTo(x,z), pickup(id), gatherNode(nodeId), addToPartyWhitelist("name"), removeFromPartyWhitelist("name"), addBuff("name", needsWeaponSwap), setBuffNeedsSwap("name", bool), addPartyBuff("name", needsWeaponSwap), removePartyBuff("name"), setPartyBuffNeedsSwap("name", bool), addReviveSkill("name", needsWeaponSwap), removeReviveSkill("name"), setReviveSkillNeedsSwap("name", bool), setPrimaryWeapon(itemId), setPrimaryShield(itemId), setBuffWeapon(itemId), setBuffShield(itemId), buffPartyNow(), showWsStatus(), toggleDebug(), exportPacketLog(), copyPacketLog(), startBot(), stopBot(), clearMonsterCache(), createParty(expShare, itemShare), leaveParty(), registerPartyMatch("title"), respondToPartyApplication(charId, accept), raiseMastery(masteryId), setAutoMastery(masteryId, bool), setMonsterRadarVisible(bool)', 'info');
 
         // Safety net in case the WebSocket patch has not run yet (it
         // normally already ran at document-start, before the GUI).
@@ -4103,6 +4889,8 @@
         setInterval(updateStatus, 2000);
         updateStatus();
         updateVitalsDisplay();
+        updateProgressDisplay();
+        updateMasteriesPanel();
         updateBotLoopButton();
         updateLevelingStatusLine();
         updatePartyApplicationsPanel();
@@ -4112,18 +4900,21 @@
         updateActiveSkillsPanel();
         updateWeaponSettingsPanel();
         updatePartyBuffsPanel();
+        updateReviveSkillsPanel();
         updateJobPanel();
     }
     // ============================================================
     //  13b. MONSTER RADAR PANEL
     // ============================================================
+    // Hidden by default - toggled on via the "Show Monster Radar window"
+    // checkbox in the Debug tab (see window.setMonsterRadarVisible).
     function createMonsterPanel() {
         if (document.getElementById('sb-monster-panel')) {
-            document.getElementById('sb-monster-panel').style.display = 'flex';
             return;
         }
         const monsterPanel = document.createElement('div');
         monsterPanel.id = 'sb-monster-panel';
+        monsterPanel.style.display = 'none';
         monsterPanel.innerHTML = `
             <div class="panel-header">
                 <span class="panel-title">Monster Radar</span>
@@ -4144,18 +4935,8 @@
         `;
         document.body.appendChild(monsterPanel);
 
-        const showMonsterBtn = document.createElement('button');
-        showMonsterBtn.id = 'sb-show-monster-btn';
-        showMonsterBtn.textContent = 'Show Monster Radar';
-        showMonsterBtn.addEventListener('click', () => {
-            monsterPanel.style.display = 'flex';
-            showMonsterBtn.style.display = 'none';
-        });
-        document.body.appendChild(showMonsterBtn);
-
         document.getElementById('sb-monster-panel-close').addEventListener('click', () => {
-            monsterPanel.style.display = 'none';
-            showMonsterBtn.style.display = 'block';
+            window.setMonsterRadarVisible(false);
         });
         document.getElementById('sb-monster-refresh').addEventListener('click', () => {
             clearMonsterCache();
@@ -4171,6 +4952,15 @@
         }, 1000);
         updateMonsterPanel();
     }
+    // Shows/hides the Monster Radar window and keeps the Debug tab checkbox
+    // in sync (both directions - the panel's own close button also routes
+    // through here).
+    window.setMonsterRadarVisible = function(visible) {
+        const monsterPanel = document.getElementById('sb-monster-panel');
+        if (monsterPanel) monsterPanel.style.display = visible ? 'flex' : 'none';
+        const toggle = document.getElementById('sb-monster-radar-toggle');
+        if (toggle) toggle.checked = visible;
+    };
     // ============================================================
     //  14. REINJECT
     // ============================================================
@@ -4182,14 +4972,14 @@
         if (showBtn) showBtn.remove();
         const oldMonsterPanel = document.getElementById('sb-monster-panel');
         if (oldMonsterPanel) oldMonsterPanel.remove();
-        const showMonsterBtn = document.getElementById('sb-show-monster-btn');
-        if (showMonsterBtn) showMonsterBtn.remove();
 
         // The WebSocket hook is left in place - resetting it would lose the
         // connection to the original constructor.
         window.__entityCache = {};
         window.__activeSkills = [];
         window.__pickupQueue = [];
+        window.__lootOwnerLocked = {};
+        window.__lastRemIds = [];
         window.__logEntries = [];
         window.__currentTarget = null;
         window.__isFighting = false;
@@ -4239,6 +5029,6 @@
     }).observe(document, { subtree: true, childList: true });
 
     console.log('Silkroad Bot Helper loaded.');
-    console.log('Commands: attack(), basicAttack(), addSkill("name"), addBuff("name"), showBuffs(), addItemBuff("itemId"), removeItemBuff("itemId"), getAvailableSkills(), moveTo(x,z), pickup(id), gatherNode(nodeId), addToPartyWhitelist("name"), removeFromPartyWhitelist("name"), addBuff("name", needsWeaponSwap), setBuffNeedsSwap("name", bool), addPartyBuff("name", needsWeaponSwap), removePartyBuff("name"), setPartyBuffNeedsSwap("name", bool), setPrimaryWeapon(itemId), setPrimaryShield(itemId), setBuffWeapon(itemId), setBuffShield(itemId), buffPartyNow(), showWsStatus(), toggleDebug(), exportPacketLog(), copyPacketLog(), startBot(), stopBot(), clearMonsterCache(), createParty(expShare, itemShare), leaveParty(), registerPartyMatch("title"), respondToPartyApplication(charId, accept)');
+    console.log('Commands: attack(), basicAttack(), addSkill("name"), addBuff("name"), showBuffs(), addItemBuff("itemId"), removeItemBuff("itemId"), getAvailableSkills(), moveTo(x,z), pickup(id), gatherNode(nodeId), addToPartyWhitelist("name"), removeFromPartyWhitelist("name"), addBuff("name", needsWeaponSwap), setBuffNeedsSwap("name", bool), addPartyBuff("name", needsWeaponSwap), removePartyBuff("name"), setPartyBuffNeedsSwap("name", bool), addReviveSkill("name", needsWeaponSwap), removeReviveSkill("name"), setReviveSkillNeedsSwap("name", bool), setPrimaryWeapon(itemId), setPrimaryShield(itemId), setBuffWeapon(itemId), setBuffShield(itemId), buffPartyNow(), showWsStatus(), toggleDebug(), exportPacketLog(), copyPacketLog(), startBot(), stopBot(), clearMonsterCache(), createParty(expShare, itemShare), leaveParty(), registerPartyMatch("title"), respondToPartyApplication(charId, accept), raiseMastery(masteryId), setAutoMastery(masteryId, bool), setMonsterRadarVisible(bool)');
     console.log('If something looks broken, run reinjectBot().');
 })();
